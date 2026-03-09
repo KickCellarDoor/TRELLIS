@@ -33,7 +33,7 @@ EXT = {
     'TARGA': 'tga'
 }
 
-def init_render(engine='CYCLES', resolution=512, geo_mode=False):
+def init_render(engine='CYCLES', resolution=512, geo_mode=False, compute_device_type='CUDA'):
     bpy.context.scene.render.engine = engine
     bpy.context.scene.render.resolution_x = resolution
     bpy.context.scene.render.resolution_y = resolution
@@ -41,7 +41,7 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.render.image_settings.file_format = 'PNG'
     bpy.context.scene.render.image_settings.color_mode = 'RGBA'
     bpy.context.scene.render.film_transparent = True
-    
+
     bpy.context.scene.cycles.device = 'GPU'
     bpy.context.scene.cycles.samples = 128 if not geo_mode else 1
     bpy.context.scene.cycles.filter_type = 'BOX'
@@ -51,9 +51,24 @@ def init_render(engine='CYCLES', resolution=512, geo_mode=False):
     bpy.context.scene.cycles.transparent_max_bounces = 3 if not geo_mode else 0
     bpy.context.scene.cycles.transmission_bounces = 3 if not geo_mode else 1
     bpy.context.scene.cycles.use_denoising = True
-        
-    bpy.context.preferences.addons['cycles'].preferences.get_devices()
-    bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
+
+    prefs = bpy.context.preferences.addons['cycles'].preferences
+    prefs.get_devices()
+    requested_device_type = compute_device_type.upper()
+    try:
+        prefs.compute_device_type = requested_device_type
+    except TypeError:
+        print(f'[WARN] Unsupported compute_device_type={requested_device_type}, fallback to CUDA')
+        prefs.compute_device_type = 'CUDA'
+
+    enabled_gpu = 0
+    for device in prefs.devices:
+        if device.type in {'CUDA', 'OPTIX', 'HIP', 'METAL', 'ONEAPI'}:
+            device.use = True
+            enabled_gpu += 1
+        else:
+            device.use = False
+    print(f'[INFO] Cycles compute_device_type={prefs.compute_device_type}, enabled_gpu_devices={enabled_gpu}')
     
 def init_nodes(save_depth=False, save_normal=False, save_albedo=False, save_mist=False):
     if not any([save_depth, save_normal, save_albedo, save_mist]):
@@ -417,7 +432,7 @@ def main(arg):
     os.makedirs(arg.output_folder, exist_ok=True)
     
     # Initialize context
-    init_render(engine=arg.engine, resolution=arg.resolution, geo_mode=arg.geo_mode)
+    init_render(engine=arg.engine, resolution=arg.resolution, geo_mode=arg.geo_mode, compute_device_type=arg.compute_device_type)
     outputs, spec_nodes = init_nodes(
         save_depth=arg.save_depth,
         save_normal=arg.save_normal,
@@ -521,6 +536,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_mist', action='store_true', help='Save the mist distance maps.')
     parser.add_argument('--split_normal', action='store_true', help='Split the normals of the mesh.')
     parser.add_argument('--save_mesh', action='store_true', help='Save the mesh as a .ply file.')
+    parser.add_argument('--compute_device_type', type=str, default='CUDA', help='Cycles device backend: CUDA/OPTIX/HIP/METAL/ONEAPI')
     argv = sys.argv[sys.argv.index("--") + 1:]
     args = parser.parse_args(argv)
 
