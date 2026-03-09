@@ -4,6 +4,7 @@ import copy
 import sys
 import importlib
 import argparse
+import subprocess
 import pandas as pd
 from easydict import EasyDict as edict
 from functools import partial
@@ -24,7 +25,7 @@ def _install_blender():
         os.system(f'tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}')
 
 
-def _render(file_path, sha256, output_dir, num_views):
+def _render(file_path, sha256, output_dir, num_views, gpu_id=None, blender_threads=0, compute_device_type='CUDA'):
     output_folder = os.path.join(output_dir, 'renders', sha256)
     
     # Build camera {yaw, pitch, radius, fov}
@@ -47,18 +48,63 @@ def _render(file_path, sha256, output_dir, num_views):
         '--resolution', '512',
         '--output_folder', output_folder,
         '--engine', 'CYCLES',
+        '--compute_device_type', compute_device_type,
         '--save_mesh',
     ]
+    if blender_threads > 0:
+        args[1:1] = ['--threads', str(blender_threads)]
     if file_path.endswith('.blend'):
         args.insert(1, file_path)
-    
-    call(args, stdout=DEVNULL, stderr=DEVNULL)
+
+    env = os.environ.copy()
+    if gpu_id is not None:
+        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    call(args, stdout=DEVNULL, stderr=DEVNULL, env=env)
     
     if os.path.exists(os.path.join(output_folder, 'transforms.json')):
         return {'sha256': sha256, 'rendered': True}
 
 
+def _parse_gpu_ids(gpu_ids):
+    if gpu_ids is None:
+        return []
+    return [int(g.strip()) for g in gpu_ids.split(',') if g.strip()]
+
+
+def _remove_flag(argv, flag):
+    return [arg for arg in argv if arg != flag]
+
+
+def _effective_workers(max_workers, tasks_per_gpu):
+    if tasks_per_gpu is None:
+        return max_workers
+    return tasks_per_gpu
+
+
+def _launch_per_gpu(raw_args, gpu_ids):
+    world_size = len(gpu_ids)
+    base_args = _remove_flag(raw_args, '--launch_per_gpu')
+    processes = []
+    for rank, gpu_id in enumerate(gpu_ids):
+        child_args = [
+            sys.executable,
+            __file__,
+            sys.argv[1],
+            *base_args,
+            '--rank', str(rank),
+            '--world_size', str(world_size),
+            '--gpu_id', str(gpu_id),
+        ]
+        print(f'[Launcher] Start rank={rank}, gpu={gpu_id}')
+        processes.append(subprocess.Popen(child_args))
+
+    exit_codes = [proc.wait() for proc in processes]
+    if any(code != 0 for code in exit_codes):
+        raise RuntimeError(f'One or more GPU workers failed: {exit_codes}')
+
+
 if __name__ == '__main__':
+    raw_args = sys.argv[2:]
     dataset_utils = importlib.import_module(f'datasets.{sys.argv[1]}')
 
     parser = argparse.ArgumentParser()
@@ -74,8 +120,28 @@ if __name__ == '__main__':
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--max_workers', type=int, default=8)
-    opt = parser.parse_args(sys.argv[2:])
+    parser.add_argument('--tasks_per_gpu', type=int, default=None,
+                        help='Concurrent render tasks per GPU process (overrides --max_workers when set)')
+    parser.add_argument('--gpu_id', type=int, default=None,
+                        help='Single GPU id bound to this process via CUDA_VISIBLE_DEVICES')
+    parser.add_argument('--gpu_ids', type=str, default=None,
+                        help='Comma-separated GPU ids used by --launch_per_gpu, e.g. "0,1,2,3"')
+    parser.add_argument('--launch_per_gpu', action='store_true',
+                        help='Spawn one process per GPU id and shard work across ranks automatically')
+    parser.add_argument('--blender_threads', type=int, default=0,
+                        help='CPU threads per blender process (0 uses blender default)')
+    parser.add_argument('--compute_device_type', type=str, default='CUDA',
+                        help='Cycles backend for Blender: CUDA/OPTIX/HIP/METAL/ONEAPI')
+    opt = parser.parse_args(raw_args)
     opt = edict(vars(opt))
+    opt.max_workers = _effective_workers(opt.max_workers, opt.tasks_per_gpu)
+
+    if opt.launch_per_gpu and opt.rank == 0 and opt.world_size == 1:
+        gpu_ids = _parse_gpu_ids(opt.gpu_ids)
+        if not gpu_ids:
+            raise ValueError('--launch_per_gpu requires non-empty --gpu_ids, e.g. --gpu_ids 0,1,2,3')
+        _launch_per_gpu(raw_args, gpu_ids)
+        sys.exit(0)
 
     os.makedirs(os.path.join(opt.output_dir, 'renders'), exist_ok=True)
     
@@ -113,9 +179,17 @@ if __name__ == '__main__':
             metadata = metadata[metadata['sha256'] != sha256]
                 
     print(f'Processing {len(metadata)} objects...')
+    print(f'Runtime config: max_workers={opt.max_workers}, gpu_id={opt.gpu_id}, world_size={opt.world_size}', flush=True)
 
     # process objects
-    func = partial(_render, output_dir=opt.output_dir, num_views=opt.num_views)
+    func = partial(
+        _render,
+        output_dir=opt.output_dir,
+        num_views=opt.num_views,
+        gpu_id=opt.gpu_id,
+        blender_threads=opt.blender_threads,
+        compute_device_type=opt.compute_device_type,
+    )
     rendered = dataset_utils.foreach_instance(metadata, opt.output_dir, func, max_workers=opt.max_workers, desc='Rendering objects')
     rendered = pd.concat([rendered, pd.DataFrame.from_records(records)])
     rendered.to_csv(os.path.join(opt.output_dir, f'rendered_{opt.rank}.csv'), index=False)
